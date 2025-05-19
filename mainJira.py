@@ -11,6 +11,9 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from threading import Thread
 
+import time
+
+from getComponents import get_jira_components , get_jira_environments, match_multiple_items
 # Load env vars
 load_dotenv()
 
@@ -18,18 +21,22 @@ app = Flask(__name__)
 
 # ENV vars
 SLACK_VERIFICATION_TOKEN = os.getenv("SLACK_VERIFICATION_TOKEN")
-JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
-JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
 GEMINI_API_TOKEN = os.getenv("GEMINI_API_TOKEN")
 
+JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
+JIRA_EMAIL = os.getenv("JIRA_EMAIL")
+
+PRIORITY_SHEET = os.getenv("PRIORITY_SHEET")
+
 # Load model and Jira data
 model = SentenceTransformer('all-MPNET-base-v2')
 embeddings = joblib.load("jira_embeddings_v2.pkl")
+
+
 df = joblib.load("jira_df_v2.pkl")
-# priority_df = joblib.load("priority_rules_df.pkl")
-# priority_embeddings = joblib.load("priority_rules_embeddings.pkl")
+
 
 # Gemini setup
 genai.configure(api_key=GEMINI_API_TOKEN)
@@ -80,6 +87,8 @@ Rules:
 
 Instructions:
 - Match based on component, product, or use-case.
+- Be careful with numbers - For example "more than 150" is the same as "greater than 100", "less than 9" is the same as "less than 10", etc...(for example)
+- More than = greater than, below = less than, etc...
 - Respect hard constraints (e.g., "Import issues cannot be P1 or P0").
 - If no strong match is found, default to P3.
 
@@ -112,8 +121,10 @@ def analyze_issue_context(issue_key, summary, comments_dict):
         return f"⚠️ Failed to analyze this issue: {str(e)}"
 
 
-@app.route('/similar', methods=['POST'])
+@app.route('/pixie-similar', methods=['POST'])
 def handle_similar():
+    print(repr(JIRA_API_TOKEN))
+    start_similar_time = time.time()
     if request.form.get('token') != SLACK_VERIFICATION_TOKEN:
         return "Invalid verification token", 403
 
@@ -125,7 +136,9 @@ def handle_similar():
         high_conf_results = results[results['Similarity'] > 50]
         
         if high_conf_results.empty:
-            message = f"No similar tickets with high confidence for: _{query}_\nUse `/create` to create a new ticket."
+            predicted_priority = predict_priority_with_gemini(query)
+            message = f"Predicted priority based on issue {predicted_priority}\n\nPixie✨ is not confident in any resolution for this query :(  _{query}_\nUse `/pixie-create` to create a new ticket."
+            
         else:
             lines = [f"*Top Similar Issues for:* _{query}_\n"]
 
@@ -141,11 +154,12 @@ def handle_similar():
             predicted_priority = predict_priority_with_gemini(issue_description)
 
             lines.append(
+                f"Pixie✨ found something!\n*Predicted Priority:* *{predicted_priority}*\nYou can check priorities *<{PRIORITY_SHEET}|here>*\n_______________________\n"
                 f"*<{JIRA_BASE_URL}/browse/{top_row['Issue key']}|{top_row['Issue key']}>* "
                 f"(`{top_row['Similarity']:.2f}%`)\n"
                 f"_{top_row['Summary']}_\n"
-                # f"> {analysis}\n"
-                f"*Predicted Priority:* {predicted_priority}\n"
+                f"> {analysis}\n"
+                
             )
 
             # Add the rest of the high-confidence results (skip the first)
@@ -162,6 +176,7 @@ def handle_similar():
                     f"_{row['Summary']}_\n"
                     f"> {analysis}\n"
                 )
+            lines.append("If you are not satisfied with Pixie's✨ resolution, she can help you crate a new JIRA ticket : `/pixie-create description | brand | environment | component | issue_type(Bug/Task)`")
 
             message = "\n".join(lines)
 
@@ -169,6 +184,9 @@ def handle_similar():
         # POST back to Slack
         try:
             requests.post(response_url, json={"response_type": "in_channel", "text": message})
+            end_similar_time=time.time()
+            exec_time = end_similar_time-start_similar_time
+            print(f"Execution time : {exec_time:.4f} seconds")
         except Exception as e:
             print(f"❌ Slack response failed: {e}")
 
@@ -176,43 +194,45 @@ def handle_similar():
     Thread(target=process_and_respond).start()
     return jsonify(
     response_type="ephemeral",
-    text="Loading similar tickets... Please wait a few seconds."
+    text="Pixie✨ is working really hard to give you the best response, give her a minute..."
     ), 200
 
-def predict_priority(issue_text):
-    issue_embedding = model.encode([issue_text], normalize_embeddings=True)
-    sims = cosine_similarity(issue_embedding, priority_embeddings)[0]
-    best_idx = np.argmax(sims)
-
-    if sims[best_idx] < 0.40:
-        return "No matching rule found"
-
-    row = priority_df.iloc[best_idx]
-    for level in [' P0', 'P1', 'P2', 'P3']:
-        if str(row[level]).strip().lower() == 'yes':
-            return f"{row['Feature/Product']} | {row['Component']} → Qualifies as ≤{level}"
-
-    return f"{row['Feature/Product']} | {row['Component']} → Only P3"
 
 
 
-@app.route('/create', methods=['POST'])
+
+@app.route('/pixie-create', methods=['POST'])
 def create_ticket():
     if request.form.get('token') != SLACK_VERIFICATION_TOKEN:
         return "Invalid verification token", 403
 
-    text = request.form.get('text')  # Expected format: "description || brand || environment"
+    text = request.form.get('text')  # Expected format: "description | brand | environment | component | issue_type(Bug/Task)"
     user = request.form.get('user_name')
 
     try:
-        description_text, brand, environment = [x.strip() for x in text.split("||")]
+        description_text, brand, environment, component, issue_type = [x.strip() for x in text.split("|")]
     except ValueError:
-        return jsonify(response_type="ephemeral", text="❌ Invalid format. Use:\n`/create description || brand || environment`")
+        return jsonify(response_type="ephemeral", text="Pixie✨ doesn't understand this syntax :( \nUse: `/pixie-create description | brand | environment | component | issue_type(Bug/Task)`\n")
 
+    valid_components = get_jira_components()
+    # valid_environments = get_jira_environments()
+
+    # Split user input (assumes comma-separated)
+    env_inputs = [e.strip() for e in environment.split(",")]
+    comp_inputs = [c.strip() for c in component.split(",")]
+
+    # Match
+    # matched_envs = match_multiple_items(env_inputs, valid_environments)
+    matched_comps = match_multiple_items(comp_inputs, valid_components)
+    # print(f"env : {matched_envs}")
+    print(f"comp : {matched_comps}")
+
+
+    # Create issue payload
     issue_data = {
         "fields": {
             "project": {"key": JIRA_PROJECT_KEY},
-            "summary": f"Issue from Slack by {user}",
+            "summary": f"{description_text} : Pixie✨",
             "description": {
                 "type": "doc",
                 "version": 1,
@@ -223,10 +243,10 @@ def create_ticket():
                     }
                 ]
             },
-            "issuetype": {"name": "Task"},
+            "issuetype": {"name": issue_type},
             "customfield_11997": [{"value": brand}],
-            "customfield_11800": [{"value": environment}],
-            "components": [{"name": "FT"}]
+            "customfield_11800": [{"value": env} for env in env_inputs],
+            "components": [{"name": comp} for comp in matched_comps]
         }
     }
 
@@ -239,12 +259,57 @@ def create_ticket():
 
     if response.status_code == 201:
         issue_key = response.json()["key"]
+
+        # ✨ Find and post similar tickets
+        try:
+            similar_results = find_similar_tickets(description_text)
+            high_conf = similar_results[similar_results['Similarity'] > 50]
+
+            if not high_conf.empty:
+                comment_lines = ["Pixie✨ found some similar JIRA tickets that may help you:\n"]
+                for _, row in high_conf.head(3).iterrows():
+                    issue_url = f"{JIRA_BASE_URL}/browse/{row['Issue key']}"
+                    comment_lines.append(
+                        f"- {row['Issue key']} : {issue_url}   "
+                        f"({row['Similarity']:.1f}% match) : {row['Summary']}"
+                    )
+                comment_body = "\n\n".join(comment_lines)
+
+                comment_payload = {
+  "body": {
+    "type": "doc",
+    "version": 1,
+    "content": [
+      {
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": comment_body
+          }
+        ]
+      }
+    ]
+  }
+}
+
+                requests.post(
+                    f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/comment",
+                    json=comment_payload,
+                    auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+                    headers={"Accept": "application/json", "Content-Type": "application/json"}
+                )
+
+        except Exception as e:
+            print(f"⚠️ Failed to add similar ticket comment: {e}")
+
         return jsonify(
-    response_type="in_channel",
-    text=f"✅ Jira ticket created: *<{JIRA_BASE_URL}/browse/{issue_key}|{issue_key}>*")
+            response_type="in_channel",
+            text=f"✅ Pixie✨ created a new ticket: *<{JIRA_BASE_URL}/browse/{issue_key}|{issue_key}>*"
+        )
+
     else:
-        return jsonify(response_type="ephemeral", text=f"❌ Jira error: {response.text}")
-    
+        return jsonify(response_type="ephemeral", text=f"❌ Pixie✨ received this error from JIRA: {response.text}")
 
 
 
